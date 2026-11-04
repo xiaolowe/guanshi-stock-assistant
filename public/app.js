@@ -842,7 +842,7 @@ async function loadChart() {
       state.chartPayload = {
         mode: 'trend',
         points: data.points,
-        preClose: data.preClose,
+        preClose: data.preClose ?? state.quote?.prevClose ?? null,
         decimals: data.decimal ?? 2,
       };
       chart.setData(state.chartPayload);

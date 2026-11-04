@@ -101,6 +101,121 @@ function normalizeQuote(it) {
   };
 }
 
+function numText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text || text === '-' || text === '--') return null;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function tencentSymbol(secid) {
+  const { market, code } = secidParts(secid);
+  if (market === '1') return `sh${code}`;
+  if (market === '0') return /^(4|8|92)/.test(code) ? `bj${code}` : `sz${code}`;
+  return null;
+}
+
+function normalizeTencentQuote(line) {
+  const match = line.match(/^v_([a-z]{2})(\d{6})="(.*)";?\s*$/);
+  if (!match) return null;
+  const prefix = match[1];
+  const code = match[2];
+  const parts = match[3].split('~');
+  if (parts.length < 50) return null;
+  const price = numText(parts[3]);
+  if (price === null) return null;
+
+  const amountWan = numText(parts[37]);
+  const floatCapYi = numText(parts[44]);
+  const marketCapYi = numText(parts[45]);
+
+  return {
+    secid: `${prefix === 'sh' ? 1 : 0}.${code}`,
+    code,
+    market: prefix === 'sh' ? 1 : 0,
+    name: parts[1],
+    price,
+    change: numText(parts[31]),
+    pct: numText(parts[32]),
+    open: numText(parts[5]),
+    prevClose: numText(parts[4]),
+    high: numText(parts[33]),
+    low: numText(parts[34]),
+    volume: numText(parts[6]),
+    amount: amountWan === null ? null : amountWan * 10000,
+    amplitude: numText(parts[43]),
+    turnover: numText(parts[38]),
+    pe: numText(parts[52]),
+    volumeRatio: numText(parts[49]),
+    pb: numText(parts[46]),
+    marketCap: marketCapYi !== null && marketCapYi > 0 ? marketCapYi * 1e8 : null,
+    floatCap: floatCapYi !== null && floatCapYi > 0 ? floatCapYi * 1e8 : null,
+    mainInflow: null,
+    mainInflowPct: null,
+    time: null,
+  };
+}
+
+async function fetchTencentQuotes(secids) {
+  const symbols = secids.map(tencentSymbol).filter(Boolean);
+  if (!symbols.length) return [];
+  const res = await fetch(`https://qt.gtimg.cn/q=${symbols.join(',')}`, {
+    headers: { 'user-agent': UA, referer: 'https://gu.qq.com/' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`tencent ${res.status}`);
+  const text = new TextDecoder('gbk').decode(await res.arrayBuffer());
+  return text.split('\n').map(normalizeTencentQuote).filter(Boolean);
+}
+
+async function fetchEastmoneySingle(secid) {
+  const fields =
+    'f12,f13,f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f62,f116,f117,f124,f162,f167,f168,f169,f170,f171,f184';
+  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${encodeURIComponent(
+    secid
+  )}&fltt=2&invt=2&fields=${fields}`;
+  const body = await upstream(url);
+  const d = body?.data;
+  if (!d || num(d.f43) === null) return null;
+  return {
+    secid: `${d.f13}.${d.f12}`,
+    code: d.f12,
+    market: num(d.f13),
+    name: d.f58,
+    price: num(d.f43),
+    change: num(d.f169),
+    pct: num(d.f170),
+    open: num(d.f46),
+    prevClose: num(d.f60),
+    high: num(d.f44),
+    low: num(d.f45),
+    volume: num(d.f47),
+    amount: num(d.f48),
+    amplitude: num(d.f171),
+    turnover: num(d.f168),
+    pe: num(d.f162),
+    volumeRatio: num(d.f50),
+    pb: num(d.f167),
+    marketCap: num(d.f116),
+    floatCap: num(d.f117),
+    mainInflow: num(d.f62),
+    mainInflowPct: num(d.f184),
+    time: num(d.f124),
+  };
+}
+
+async function fetchEastmoneyBatch(secids) {
+  const fields =
+    'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f62,f124,f184';
+  const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&secids=${encodeURIComponent(
+    secids.join(',')
+  )}&fields=${fields}`;
+  const body = await upstream(url);
+  const items = Array.isArray(body?.data?.diff) ? body.data.diff : [];
+  return items.map(normalizeQuote).filter((it) => it.secid);
+}
+
 async function handleQuote(params) {
   const raw = String(params.get('secids') || '');
   const secids = raw.split(',').map((s) => s.trim()).filter(Boolean);
@@ -109,17 +224,123 @@ async function handleQuote(params) {
     err.status = 400;
     throw err;
   }
-  const fields =
-    'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f62,f124,f184';
+
   const key = `q:${secids.join(',')}`;
   return cached(key, 3000, async () => {
-    const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&secids=${encodeURIComponent(
-      secids.join(',')
-    )}&fields=${fields}`;
-    const body = await upstream(url);
-    const items = Array.isArray(body?.data?.diff) ? body.data.diff : [];
-    return { items: items.map(normalizeQuote).filter((it) => it.secid) };
+    if (secids.length === 1) {
+      try {
+        const item = await fetchEastmoneySingle(secids[0]);
+        if (item) return { items: [item] };
+      } catch {
+        /* fall back to Tencent */
+      }
+    }
+
+    try {
+      const items = await fetchTencentQuotes(secids);
+      if (items.length) {
+        const got = new Set(items.map((item) => item.secid));
+        const missing = secids.filter((secid) => !got.has(secid));
+        if (missing.length && missing.length <= 5) {
+          const extra = await Promise.all(
+            missing.map((secid) => fetchEastmoneySingle(secid).catch(() => null))
+          );
+          items.push(...extra.filter(Boolean));
+        }
+        return { items };
+      }
+    } catch {
+      /* fall back to Eastmoney batch */
+    }
+
+    const items = await fetchEastmoneyBatch(secids);
+    if (items.length) return { items };
+    throw new Error('all quote providers failed');
   });
+}
+
+async function fetchEastmoneyKline(secid, klt, lmt) {
+  const fields1 = 'f1,f2,f3,f4,f5,f6';
+  const fields2 = 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61';
+  const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&klt=${klt}&fqt=1&lmt=${lmt}&end=20500101&fields1=${fields1}&fields2=${fields2}`;
+  const body = await upstream(url);
+  const data = body?.data;
+  if (!data) throw new Error('no kline data');
+  const klines = (data.klines || []).map((line) => {
+    const p = line.split(',');
+    return {
+      date: p[0],
+      open: Number(p[1]),
+      close: Number(p[2]),
+      high: Number(p[3]),
+      low: Number(p[4]),
+      volume: Number(p[5]),
+      amount: Number(p[6]),
+      amplitude: Number(p[7]),
+      pct: Number(p[8]),
+      change: Number(p[9]),
+      turnover: Number(p[10]),
+    };
+  });
+  return {
+    secid,
+    code: data.code,
+    name: data.name,
+    decimal: num(data.decimal),
+    preClose: num(data.preKPrice),
+    klines,
+  };
+}
+
+async function fetchTencentKline(secid, klt, lmt) {
+  const period = { 101: 'day', 102: 'week', 103: 'month' }[klt];
+  if (!period) throw new Error(`tencent kline unsupported klt ${klt}`);
+  const symbol = tencentSymbol(secid);
+  if (!symbol) throw new Error('invalid symbol');
+
+  const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},${period},,,${lmt},qfq`;
+  const res = await fetch(url, {
+    headers: { 'user-agent': UA, referer: 'https://gu.qq.com/' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`tencent kline ${res.status}`);
+  const body = await res.json();
+  const payload = body?.data?.[symbol];
+  const rows = payload?.[`qfq${period}`] || payload?.[period];
+  if (!Array.isArray(rows) || !rows.length) throw new Error('tencent kline empty');
+
+  const klines = rows.map((row, index) => {
+    const [date, openText, closeText, highText, lowText, volumeText] = row;
+    const open = Number(openText);
+    const close = Number(closeText);
+    const high = Number(highText);
+    const low = Number(lowText);
+    const volume = Number(volumeText);
+    const prevClose = index > 0 ? Number(rows[index - 1][2]) : open;
+    const change = close - prevClose;
+    return {
+      date,
+      open,
+      close,
+      high,
+      low,
+      volume,
+      amount: null,
+      amplitude: prevClose ? ((high - low) / prevClose) * 100 : 0,
+      pct: prevClose ? (change / prevClose) * 100 : 0,
+      change,
+      turnover: null,
+    };
+  });
+
+  return {
+    secid,
+    code: symbol.slice(2),
+    name: '',
+    decimal: 2,
+    preClose: null,
+    klines,
+  };
 }
 
 async function handleKline(params) {
@@ -131,37 +352,117 @@ async function handleKline(params) {
 
   const key = `k:${secid}:${klt}:${lmt}`;
   return cached(key, 30000, async () => {
-    const fields1 = 'f1,f2,f3,f4,f5,f6';
-    const fields2 = 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61';
-    const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&klt=${klt}&fqt=1&lmt=${lmt}&end=20500101&fields1=${fields1}&fields2=${fields2}`;
-    const body = await upstream(url);
-    const data = body?.data;
-    if (!data) throw new Error('no kline data');
-    const klines = (data.klines || []).map((line) => {
+    try {
+      const data = await fetchEastmoneyKline(secid, klt, lmt);
+      if (data.klines.length) return data;
+    } catch {
+      /* fall back to Tencent */
+    }
+    return fetchTencentKline(secid, klt, lmt);
+  });
+}
+
+async function fetchEastmoneyTrend(secid) {
+  const fields1 = 'f1,f2,f3,f4,f5,f6,f7,f8';
+  const fields2 = 'f51,f52,f53,f54,f55,f56,f57,f58';
+  const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${secid}&ndays=1&iscr=0&fields1=${fields1}&fields2=${fields2}`;
+  const body = await upstream(url);
+  const data = body?.data;
+  if (!data) throw new Error('no trend data');
+  const points = (data.trends || [])
+    .map((line) => {
       const p = line.split(',');
+      if (p.length < 8) return null;
       return {
-        date: p[0],
-        open: Number(p[1]),
-        close: Number(p[2]),
-        high: Number(p[3]),
-        low: Number(p[4]),
+        time: p[0],
+        price: Number(p[2]),
+        avg: Number(p[7]),
         volume: Number(p[5]),
         amount: Number(p[6]),
-        amplitude: Number(p[7]),
-        pct: Number(p[8]),
-        change: Number(p[9]),
-        turnover: Number(p[10]),
       };
-    });
-    return {
-      secid,
-      code: data.code,
-      name: data.name,
-      decimal: num(data.decimal),
-      preClose: num(data.preKPrice),
-      klines,
-    };
+    })
+    .filter((p) => p && Number.isFinite(p.price));
+  return {
+    secid,
+    code: data.code,
+    name: data.name,
+    decimal: num(data.decimal),
+    preClose: num(data.preClose) || num(data.preSettlement),
+    points,
+  };
+}
+
+async function fetchTencentTrend(secid) {
+  const symbol = tencentSymbol(secid);
+  if (!symbol) throw new Error('invalid symbol');
+
+  const url = `https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=${symbol}`;
+  const res = await fetch(url, {
+    headers: { 'user-agent': UA, referer: 'https://gu.qq.com/' },
+    signal: AbortSignal.timeout(8000),
   });
+  if (!res.ok) throw new Error(`tencent minute ${res.status}`);
+  const body = await res.json();
+  const payload = body?.data?.[symbol]?.data;
+  const rows = payload?.data;
+  if (!Array.isArray(rows) || !rows.length) throw new Error('tencent minute empty');
+
+  const date = String(payload.date || '');
+  const preClose = numText(payload.prec);
+  const isIndex =
+    (symbol.startsWith('sh') && symbol.slice(2).startsWith('000')) ||
+    (symbol.startsWith('sz') && symbol.slice(2).startsWith('399'));
+  let prevVolume = 0;
+  let prevAmount = 0;
+  let priceSum = 0;
+  let priceCount = 0;
+
+  const points = rows
+    .map((row) => {
+      const parts = String(row).split(/\s+/);
+      if (parts.length < 4) return null;
+      const clock = parts[0];
+      const price = Number(parts[1]);
+      const cumVolume = Number(parts[2]);
+      const cumAmount = Number(parts[3]);
+      if (!Number.isFinite(price) || !Number.isFinite(cumVolume) || !Number.isFinite(cumAmount)) {
+        return null;
+      }
+      const volume = Math.max(0, cumVolume - prevVolume);
+      const amount = Math.max(0, cumAmount - prevAmount);
+      prevVolume = cumVolume;
+      prevAmount = cumAmount;
+      const mins = Number(clock.slice(0, 2)) * 60 + Number(clock.slice(2, 4));
+      const inSession = (mins >= 570 && mins <= 690) || (mins >= 780 && mins <= 900);
+      if (!inSession) return null;
+      priceSum += price;
+      priceCount += 1;
+      const time =
+        date.length === 8
+          ? `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)} ${clock.slice(0, 2)}:${clock.slice(2, 4)}`
+          : clock;
+      return {
+        time,
+        price,
+        avg: isIndex
+          ? priceSum / priceCount
+          : cumVolume > 0
+            ? cumAmount / (cumVolume * 100)
+            : price,
+        volume,
+        amount,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    secid,
+    code: symbol.slice(2),
+    name: '',
+    decimal: 2,
+    preClose,
+    points,
+  };
 }
 
 async function handleTrends(params) {
@@ -169,33 +470,13 @@ async function handleTrends(params) {
   if (!SECID_RE.test(secid)) throw Object.assign(new Error('secid 参数不合法'), { status: 400 });
 
   return cached(`t:${secid}`, 5000, async () => {
-    const fields1 = 'f1,f2,f3,f4,f5,f6,f7,f8';
-    const fields2 = 'f51,f52,f53,f54,f55,f56,f57,f58';
-    const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${secid}&ndays=1&iscr=0&fields1=${fields1}&fields2=${fields2}`;
-    const body = await upstream(url);
-    const data = body?.data;
-    if (!data) throw new Error('no trend data');
-    const points = (data.trends || [])
-      .map((line) => {
-        const p = line.split(',');
-        if (p.length < 8) return null;
-        return {
-          time: p[0],
-          price: Number(p[2]),
-          avg: Number(p[7]),
-          volume: Number(p[5]),
-          amount: Number(p[6]),
-        };
-      })
-      .filter((p) => p && Number.isFinite(p.price));
-    return {
-      secid,
-      code: data.code,
-      name: data.name,
-      decimal: num(data.decimal),
-      preClose: num(data.preClose) || num(data.preSettlement),
-      points,
-    };
+    try {
+      const data = await fetchEastmoneyTrend(secid);
+      if (data.points.length) return data;
+    } catch {
+      /* fall back to Tencent */
+    }
+    return fetchTencentTrend(secid);
   });
 }
 
@@ -225,41 +506,90 @@ async function handleSearch(params) {
   });
 }
 
-async function handleRank(params) {
-  const type = String(params.get('type') || 'up');
-  const limit = Math.min(Math.max(Number(params.get('limit') || 10), 5), 20);
+const SINA_RANK = {
+  up: { sort: 'changepercent', asc: 0 },
+  down: { sort: 'changepercent', asc: 1 },
+  amount: { sort: 'amount', asc: 0 },
+};
+
+async function fetchEastmoneyRank(type, limit) {
   const config = {
     up: { fid: 'f3', po: 1 },
     down: { fid: 'f3', po: 0 },
     amount: { fid: 'f6', po: 1 },
   }[type];
-  if (!config) throw Object.assign(new Error('榜单类型不合法'), { status: 400 });
+  const fs = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23';
+  const fields = 'f2,f3,f5,f6,f8,f12,f13,f14,f20,f100';
+  const url = `https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=${limit}&po=${config.po}&np=1&fltt=2&invt=2&fid=${config.fid}&fs=${encodeURIComponent(
+    fs
+  )}&fields=${fields}`;
+  const body = await upstream(url);
+  const list = Array.isArray(body?.data?.diff) ? body.data.diff : [];
+  return list
+    .map((it) => ({
+      secid: `${it.f13}.${it.f12}`,
+      code: it.f12,
+      market: num(it.f13),
+      name: it.f14,
+      price: num(it.f2),
+      pct: num(it.f3),
+      volume: num(it.f5),
+      amount: num(it.f6),
+      turnover: num(it.f8),
+      marketCap: num(it.f20),
+      industry: it.f100 || '',
+    }))
+    .filter((it) => it.price !== null);
+}
+
+async function fetchSinaRank(type, limit) {
+  const config = SINA_RANK[type];
+  const url = `https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=${
+    limit + 15
+  }&sort=${config.sort}&asc=${config.asc}&node=hs_a&symbol=&_s_r_a=page`;
+  const res = await fetch(url, {
+    headers: { 'user-agent': UA, referer: 'https://finance.sina.com.cn/' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`sina rank ${res.status}`);
+  const list = await res.json();
+  if (!Array.isArray(list)) throw new Error('sina rank invalid');
+  return list
+    .filter((it) => it && /^(sh|sz)\d{6}$/.test(it.symbol))
+    .slice(0, limit)
+    .map((it) => {
+      const marketCapWan = numText(it.mktcap);
+      return {
+        secid: `${it.symbol.startsWith('sh') ? 1 : 0}.${it.code}`,
+        code: it.code,
+        market: it.symbol.startsWith('sh') ? 1 : 0,
+        name: it.name,
+        price: numText(it.trade),
+        pct: numText(it.changepercent),
+        volume: numText(it.volume),
+        amount: numText(it.amount),
+        turnover: numText(it.turnoverratio),
+        marketCap: marketCapWan === null ? null : marketCapWan * 10000,
+        industry: '',
+      };
+    })
+    .filter((it) => it.price !== null);
+}
+
+async function handleRank(params) {
+  const type = String(params.get('type') || 'up');
+  const limit = Math.min(Math.max(Number(params.get('limit') || 10), 5), 20);
+  if (!SINA_RANK[type]) throw Object.assign(new Error('榜单类型不合法'), { status: 400 });
 
   return cached(`r:${type}:${limit}`, 12000, async () => {
-    const fs = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23';
-    const fields = 'f2,f3,f5,f6,f8,f12,f13,f14,f20,f100';
-    const url = `https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=${limit}&po=${config.po}&np=1&fltt=2&invt=2&fid=${config.fid}&fs=${encodeURIComponent(
-      fs
-    )}&fields=${fields}`;
-    const body = await upstream(url);
-    const list = Array.isArray(body?.data?.diff) ? body.data.diff : [];
-    return {
-      items: list
-        .map((it) => ({
-          secid: `${it.f13}.${it.f12}`,
-          code: it.f12,
-          market: num(it.f13),
-          name: it.f14,
-          price: num(it.f2),
-          pct: num(it.f3),
-          volume: num(it.f5),
-          amount: num(it.f6),
-          turnover: num(it.f8),
-          marketCap: num(it.f20),
-          industry: it.f100 || '',
-        }))
-        .filter((it) => it.price !== null),
-    };
+    try {
+      const items = await fetchEastmoneyRank(type, limit);
+      if (items.length) return { items };
+    } catch {
+      /* fall through to Sina */
+    }
+    const items = await fetchSinaRank(type, limit);
+    return { items };
   });
 }
 
