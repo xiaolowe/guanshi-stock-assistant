@@ -1,0 +1,14 @@
+{
+  "name": "guanshi-stock-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "观市 · A股行情与技术面小助手",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
